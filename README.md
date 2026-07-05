@@ -1,5 +1,5 @@
 # FFCC Importer
-<p align="center"><img width="930" height="556" alt="promo" src="https://github.com/user-attachments/assets/4fbb585a-949a-44f1-a02d-1d08fe3fc384" /></p>
+<img width="1000" height="600" alt="image" src="https://github.com/user-attachments/assets/cdcbe8bf-0a02-4694-9639-be8e391548ff" />
 
 Addon for Blender 5.x+ that imports 3D scene (.mpl) and character models (.chm) from Final Fantasy Crystal Chronicles for the GameCube.
 
