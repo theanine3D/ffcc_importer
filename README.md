@@ -21,8 +21,9 @@ Import settings allow you to customize some quality-of-life features.
 You can find the importers via Blender's "_FIle_" -> "_Import_" menu.
 
 ## Notes
+- _None_ of the game's 3D assets are included with this addon. You must extract the models/textures yourself from your copy of the game. The Dolphin emulator can be used to extract the models. Add the game to Dolphin, then right-click the game in the game list. Choose "Properties", then click on the "Filesystem" tab.
 - You can find character models in the game disc's "char" folder, split up into various categories (like "npc", "pc" for player characters, "wp" for weapons, etc.)
-- Scene models can be found in the "map" folder on the game disc. Make sure you extract all files for each folder, not just the .mpl, otherwise your import may be missing textures.
+- Scene models can be found in the "map" folder on the game disc. Make sure you extract all files for each folder, not just the .mpl, otherwise your import may be missing textures 
 - Animations can be found / assigned via the Dope Sheet's Action Editor. Select your armature first in the 3D viewport, then select the action in the Action Editor. If animations don't play, you may need to assign the "Object" in the Slot setting (second dropdown menu at the top of the action editor), which was added in Blender 4.4.
 - If you're interested in learning how FFCC's model/texture formats work (ie. for creating your own parser), you can find a full specification doc [here](https://github.com/theanine3D/ffcc_importer/blob/main/FFCC_FORMAT_SPEC.md).
 
