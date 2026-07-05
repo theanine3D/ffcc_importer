@@ -29,7 +29,9 @@ You can find the importers via Blender's "_FIle_" -> "_Import_" menu.
 ## Previews
 
 <img width="720" height="405" alt="1" src="https://github.com/user-attachments/assets/568a8b03-1a2e-421c-be23-2a0d766fb96b" />
-Scene imports
+
+- Scene imports
 
 <img width="1000" height="600" alt="2" src="https://github.com/user-attachments/assets/2b311b31-deb5-492e-84d5-a35286fce87e" />
-Character model imports - this includes player characters, weapons, bosses, enemies, and NPCs
+
+- Character model imports - this includes player characters, weapons, bosses, enemies, and NPCs
