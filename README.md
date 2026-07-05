@@ -10,7 +10,7 @@ Both scene models (.mpl) and character models (.chm) can be imported. All textur
 
 Import settings allow you to customize some quality-of-life features.
 - **Blend Vertex Colors** - automatically blends FFCC's original baked ambient lighting onto albedo textures, for any mesh that has vertex colors
-- **Disable Color Correction** - adjusts the Color Management settings in your scene to sRGB / Standard, so colors match the original colors from PSO
+- **Disable Color Correction** - adjusts the Color Management settings in your scene to sRGB / Standard, so colors match the original colors from FFCC
 
 ## Installation
 1. Click the green "Code" button above and press "Download ZIP"
