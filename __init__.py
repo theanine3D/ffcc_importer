@@ -725,13 +725,16 @@ def _get_material(name, image, blend=None, blend_vcolors=False, fullbright=False
         uv2.location = (uv1.location.x, -350)
         tex2.location = (decal_mix.location.x - 200, tex.location.y - 450)
     if blend_vcolors:
-        # Multiply the baked per-vertex shading onto the albedo.
+        # Multiply the baked per-vertex shading onto the albedo. Must take
+        # color_socket (the second-layer blend result when there is one),
+        # NOT tex.Color — sourcing the raw base texture here silently threw
+        # away the whole multi-texture blend.
         vcol = nodes.new('ShaderNodeVertexColor')
         vcol.layer_name = VCOLOR_LAYER_NAME
         mix = nodes.new('ShaderNodeMixRGB')
         mix.blend_type = 'MULTIPLY'
         mix.inputs['Fac'].default_value = 1.0
-        links.new(tex.outputs['Color'], mix.inputs['Color1'])
+        links.new(color_socket, mix.inputs['Color1'])
         links.new(vcol.outputs['Color'], mix.inputs['Color2'])
         vcol.location = (-500, -200)
         mix.location  = (-200, 0)
