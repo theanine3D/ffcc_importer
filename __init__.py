@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FFCC Importer",
     "author": "Theanine3D",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (5, 0, 0),
     "location": "File > Import > FFCC Map (.mpl) / FFCC Character (.chm)",
     "description": "Import Final Fantasy Crystal Chronicles map and character models",
@@ -406,30 +406,71 @@ def parse_dset(data, do, size, materials_table=None):
 
 
 # ---- MPL file parser ----
-# Returns list of (vset, groups) where groups = [(faces, tex_idx), ...]
+# Returns list of (vset, groups) where groups = [(faces, tex_idx), ...];
+# list position is the pair index the OTM scene graph refers to.
 
-def parse_mpl(data, materials_table=None):
-    mesh_sz = struct.unpack_from('>I', data, 4)[0]
-    end = 16 + mesh_sz
-    off = 16
+def parse_mpl(datas, materials_table=None):
+    """Parse the map's VSET/DSET stream.
+
+    `datas` is the ORDERED list of every mapNNN_K.mpl fragment's bytes
+    (K ascending). The fragments are pieces of ONE continuous chunk stream
+    split at arbitrary points, not independent files, so they must be
+    parsed together (see FFCC_FORMAT_SPEC.md 2.1): a fragment can end on a
+    VSET whose DSET lives in the next fragment, and the OTM's pair indices
+    count DSETs across the whole concatenation. Each DSET uses the most
+    recent VSET, which may be re-used by several DSETs in a row.
+    """
+    if isinstance(datas, (bytes, bytearray)):
+        datas = [datas]
     result = []
     pending_raw = None
-    while off + 16 <= end:
-        magic, size, u1, u2 = read_hdr(data, off)
-        if not is_printable(magic):
-            break
-        ms = magic.decode('ascii').strip()
-        do = off + 16
-        if ms == 'VSET':
-            pending_raw = parse_vset(data, do, size)
-        elif ms == 'DSET' and pending_raw is not None:
-            groups = parse_dset(data, do, size, materials_table)
-            vset = finalize_vset(pending_raw, groups)
-            result.append((vset, groups))
-            pending_raw = None
-        adv = 16 + size; adv = (adv + 15) & ~15
-        off += adv
+    for data in datas:
+        mesh_sz = struct.unpack_from('>I', data, 4)[0]
+        end = 16 + mesh_sz
+        off = 16
+        while off + 16 <= end:
+            magic, size, u1, u2 = read_hdr(data, off)
+            if not is_printable(magic):
+                break
+            ms = magic.decode('ascii').strip()
+            do = off + 16
+            if ms == 'VSET':
+                pending_raw = parse_vset(data, do, size)
+            elif ms == 'DSET' and pending_raw is not None:
+                groups = parse_dset(data, do, size, materials_table)
+                result.append((finalize_vset(pending_raw, groups), groups))
+            adv = 16 + size; adv = (adv + 15) & ~15
+            off += adv
     return result
+
+
+def _map_fragment_key(path):
+    """Identity of the MAP a .mpl belongs to: (folder, mapNNN) for a
+    mapNNN_K.mpl fragment, else the file itself."""
+    folder = os.path.dirname(path)
+    base = os.path.splitext(os.path.basename(path))[0]
+    m = re.match(r'^(map\d+)_\d+$', base, re.IGNORECASE)
+    return (folder, m.group(1).lower()) if m else (folder, base.lower())
+
+
+def collect_mpl_fragments(path):
+    """Every mapNNN_K.mpl fragment of this file's map, K ascending.
+    Returns [path] unchanged for a file that isn't a numbered fragment."""
+    folder = os.path.dirname(path)
+    base = os.path.splitext(os.path.basename(path))[0]
+    m = re.match(r'^(map\d+)_\d+$', base, re.IGNORECASE)
+    if not m:
+        return [path]
+    prefix = m.group(1)
+    found = []
+    try:
+        for fname in os.listdir(folder):
+            fm = re.match(rf'^{re.escape(prefix)}_(\d+)\.mpl$', fname, re.IGNORECASE)
+            if fm:
+                found.append((int(fm.group(1)), os.path.join(folder, fname)))
+    except OSError:
+        return [path]
+    return [p for _, p in sorted(found)] or [path]
 
 
 # ---- OTM scene-graph helpers ----
@@ -447,23 +488,42 @@ def _euler_to_matrix(rx_deg, ry_deg, rz_deg):
     )
 
 
-def _is_identity(T, R_mat, S, eps=1e-5):
-    return (abs(T[0]) < eps and abs(T[1]) < eps and abs(T[2]) < eps
-            and abs(S[0] - 1.0) < eps and abs(S[1] - 1.0) < eps and abs(S[2] - 1.0) < eps
-            and abs(R_mat[0][0] - 1.0) < eps and abs(R_mat[1][1] - 1.0) < eps
-            and abs(R_mat[2][2] - 1.0) < eps
-            and abs(R_mat[0][1]) < eps and abs(R_mat[0][2]) < eps
-            and abs(R_mat[1][0]) < eps and abs(R_mat[1][2]) < eps
-            and abs(R_mat[2][0]) < eps and abs(R_mat[2][1]) < eps)
+IDENTITY_MAT34 = (((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+                  (0.0, 0.0, 0.0))
 
 
-def _apply_trs(x, y, z, T, R_mat, S):
-    """Scale → Rotate → Translate a point in GC space."""
-    xs, ys, zs = x * S[0], y * S[1], z * S[2]
-    xr = R_mat[0][0]*xs + R_mat[0][1]*ys + R_mat[0][2]*zs
-    yr = R_mat[1][0]*xs + R_mat[1][1]*ys + R_mat[1][2]*zs
-    zr = R_mat[2][0]*xs + R_mat[2][1]*ys + R_mat[2][2]*zs
-    return xr + T[0], yr + T[1], zr + T[2]
+def _trs_to_mat34(T, R_mat, S):
+    """TRS -> (linear 3x3, translation): p' = R*(S*p) + T."""
+    lin = tuple(tuple(R_mat[r][c] * S[c] for c in range(3)) for r in range(3))
+    return (lin, tuple(T))
+
+
+def _mat34_mul(a, b):
+    """Compose parent `a` with child `b` (apply b first, then a)."""
+    (ar, at), (br, bt) = a, b
+    lin = tuple(tuple(sum(ar[r][k] * br[k][c] for k in range(3)) for c in range(3))
+                for r in range(3))
+    trans = tuple(sum(ar[r][k] * bt[k] for k in range(3)) + at[r] for r in range(3))
+    return (lin, trans)
+
+
+def _apply_mat34(x, y, z, mat):
+    lin, t = mat
+    return (lin[0][0]*x + lin[0][1]*y + lin[0][2]*z + t[0],
+            lin[1][0]*x + lin[1][1]*y + lin[1][2]*z + t[1],
+            lin[2][0]*x + lin[2][1]*y + lin[2][2]*z + t[2])
+
+
+def _normalize3(x, y, z):
+    n = math.sqrt(x*x + y*y + z*z)
+    return (x/n, y/n, z/n) if n > 1e-12 else (x, y, z)
+
+
+def _is_identity_mat34(mat, eps=1e-5):
+    lin, t = mat
+    return all(abs(t[i]) < eps for i in range(3)) and all(
+        abs(lin[r][c] - (1.0 if r == c else 0.0)) < eps
+        for r in range(3) for c in range(3))
 
 
 def _chunk_advance(sz):
@@ -471,8 +531,17 @@ def _chunk_advance(sz):
 
 
 def parse_otm(otm_path):
-    """Parse OTM SCEN section.
-    Returns {pair_idx: [(T, R_mat, S), ...]} — one entry per scene-graph instance."""
+    """Parse the OTM SCEN scene graph.
+
+    Returns {pair_idx: [mat34, ...]} — the WORLD transform of every node
+    that instances a mesh. SCEN is a hierarchy, not a flat list: a node's
+    own TFRM is parent-relative, so the world transform is the product of
+    the whole parent chain (PIDX[0] = parent's index in this same flat
+    node array, 0xFFFF = root). Props that spin or swing in place
+    (windmill wheels, doors — the nodes carrying an ANIM chunk) typically
+    have an identity TFRM of their own and get ALL of their placement from
+    ancestors, so ignoring the chain drops them at the world origin.
+    """
     data = open(otm_path, 'rb').read()
     _, sz0, _, _ = read_hdr(data, 0)
     off = 16; end = 16 + sz0
@@ -490,6 +559,7 @@ def parse_otm(otm_path):
         return {}
 
     instances = {}
+    world = []          # world mat34 per node, in file order
     off = scen_off; end = scen_off + scen_sz
     while off + 16 <= end:
         m, sz, _, _ = read_hdr(data, off)
@@ -510,14 +580,27 @@ def parse_otm(otm_path):
                     tfrm_data = data[do2:do2+s2]
                 inn += _chunk_advance(s2)
 
-            if pidx_data and len(pidx_data) >= 4 and tfrm_data and len(tfrm_data) >= 36:
+            local = IDENTITY_MAT34
+            if tfrm_data and len(tfrm_data) >= 36:
+                f = [struct.unpack_from('>f', tfrm_data, i*4)[0] for i in range(9)]
+                local = _trs_to_mat34((f[0], f[1], f[2]),
+                                      _euler_to_matrix(f[3], f[4], f[5]),
+                                      (f[6], f[7], f[8]))
+
+            # PIDX = parent_idx:u16 [, pair_idx:u16, flags:u16]. A 4-byte
+            # PIDX carries NO pair field (it is parent + flags only, always
+            # 0xFF00 = "no mesh"), so anything shorter than 6 bytes is a
+            # transform-only node. 0xFFFx pair values are also sentinels.
+            parent = struct.unpack_from('>H', pidx_data, 0)[0] if pidx_data and len(pidx_data) >= 2 else 0xffff
+            # Parents always precede their children in file order, so one
+            # forward pass suffices.
+            wm = _mat34_mul(world[parent], local) if parent < len(world) else local
+            world.append(wm)
+
+            if pidx_data and len(pidx_data) >= 6:
                 pair_idx = struct.unpack_from('>H', pidx_data, 2)[0]
-                if pair_idx != 0xffff:
-                    f = [struct.unpack_from('>f', tfrm_data, i*4)[0] for i in range(9)]
-                    T = (f[0], f[1], f[2])
-                    R_mat = _euler_to_matrix(f[3], f[4], f[5])
-                    S = (f[6], f[7], f[8])
-                    instances.setdefault(pair_idx, []).append((T, R_mat, S))
+                if pair_idx < 0xfff0:
+                    instances.setdefault(pair_idx, []).append(wm)
 
         off += _chunk_advance(sz)
 
@@ -583,17 +666,16 @@ def parse_otm_materials(otm_path):
 
 
 def _dedup_instances(pair_insts):
-    """Remove exact-duplicate transforms (e.g. two identity OTM nodes)."""
+    """Remove exact-duplicate world transforms (e.g. two identity nodes)."""
     seen = set()
     out = []
-    for T, R_mat, S in pair_insts:
-        key = (round(T[0],3), round(T[1],3), round(T[2],3),
-               round(S[0],3), round(S[1],3), round(S[2],3),
-               round(R_mat[0][0],4), round(R_mat[1][1],4), round(R_mat[2][2],4),
-               round(R_mat[0][1],4), round(R_mat[0][2],4))
+    for mat in pair_insts:
+        lin, t = mat
+        key = (tuple(round(v, 3) for v in t),
+               tuple(round(lin[r][c], 4) for r in range(3) for c in range(3)))
         if key not in seen:
             seen.add(key)
-            out.append((T, R_mat, S))
+            out.append(mat)
     return out
 
 
@@ -1696,6 +1778,20 @@ class ImportFFCCMap(Operator, ImportHelper):
         if not paths:
             paths = [self.filepath]
 
+        # mapNNN_K.mpl files are fragments of one continuous stream, so a
+        # whole map is always imported as a unit (see parse_mpl). Collapse
+        # the selection to one entry per map so selecting several fragments
+        # of the same map doesn't import it repeatedly.
+        seen_maps = set()
+        unique_paths = []
+        for p in paths:
+            key = _map_fragment_key(p)
+            if key in seen_maps:
+                continue
+            seen_maps.add(key)
+            unique_paths.append(p)
+        paths = unique_paths
+
         # Caches shared across the whole (possibly multi-file) import:
         # - per map prefix (folder, mapNNN): texture set + material table,
         #   so map000_0.mpl and map000_1.mpl reuse the same bpy Images.
@@ -1738,18 +1834,30 @@ class ImportFFCCMap(Operator, ImportHelper):
         return {'FINISHED'}
 
     def _import_one(self, context, path):
-        try:
-            data = open(path, 'rb').read()
-        except OSError as e:
-            print(f"[FFCC] Cannot open {path}: {e}")
+        # A map is imported as a whole: every mapNNN_K.mpl fragment is one
+        # piece of a single VSET/DSET stream (see parse_mpl).
+        frag_paths = collect_mpl_fragments(path)
+        datas = []
+        for fp in frag_paths:
+            try:
+                fdata = open(fp, 'rb').read()
+            except OSError as e:
+                print(f"[FFCC] Cannot open {fp}: {e}")
+                continue
+            if fdata[:4] != b'MESH':
+                print(f"[FFCC] {fp}: not a valid MPL file (expected MESH magic)")
+                continue
+            datas.append(fdata)
+        if not datas:
             return False
+        if len(frag_paths) > 1:
+            print(f"[FFCC] Map fragments: {[os.path.basename(p) for p in frag_paths]}")
 
-        if data[:4] != b'MESH':
-            print(f"[FFCC] {path}: not a valid MPL file (expected MESH magic)")
-            return False
-
-        basename = os.path.splitext(os.path.basename(path))[0]
         folder = os.path.dirname(path)
+        basename = os.path.splitext(os.path.basename(path))[0]
+        frag_m = re.match(r'^(map\d+)_\d+$', basename, re.IGNORECASE)
+        if frag_m:
+            basename = frag_m.group(1)
         map_m0 = re.match(r'^(map\d+)', basename, re.IGNORECASE)
         prefix_key = (folder, map_m0.group(1).lower() if map_m0 else basename)
 
@@ -1791,7 +1899,7 @@ class ImportFFCCMap(Operator, ImportHelper):
                 print("[FFCC] No material table — falling back to direct texture indexing")
             self._prefix_cache[prefix_key] = (images_by_index, materials_table)
 
-        mesh_data = parse_mpl(data, materials_table)
+        mesh_data = parse_mpl(datas, materials_table)
         if not mesh_data:
             print(f"[FFCC] {basename}: no mesh data found")
             return False
@@ -1810,9 +1918,6 @@ class ImportFFCCMap(Operator, ImportHelper):
             except Exception as e:
                 print(f"[FFCC] OTM load failed: {e}")
 
-        _identity_R = _euler_to_matrix(0, 0, 0)
-        _identity_inst = ((0.0, 0.0, 0.0), _identity_R, (1.0, 1.0, 1.0))
-
         print(f"[FFCC] Starting import: {basename}, {len(mesh_data)} VSET/DSET pairs")
         created = 0
         for pair_idx, (vset, groups) in enumerate(mesh_data):
@@ -1820,17 +1925,26 @@ class ImportFFCCMap(Operator, ImportHelper):
             if otm_instances and pair_idx in otm_instances:
                 pair_insts = _dedup_instances(otm_instances[pair_idx])
             else:
-                pair_insts = [_identity_inst]
+                pair_insts = [IDENTITY_MAT34]
 
-            for inst_idx, (T, R_mat, S) in enumerate(pair_insts):
+            for inst_idx, inst_mat in enumerate(pair_insts):
                 # Transform vertex positions into world space (GC coordinate space)
-                if _is_identity(T, R_mat, S):
+                if _is_identity_mat34(inst_mat):
                     inst_vset = vset
                 else:
-                    world_verts = [_apply_trs(x, y, z, T, R_mat, S)
+                    world_verts = [_apply_mat34(x, y, z, inst_mat)
                                    for x, y, z in vset['verts']]
                     inst_vset = dict(vset)
                     inst_vset['verts'] = world_verts
+                    # Normals need the instance's rotation too (direction
+                    # only — no translation), or a rotated instance keeps
+                    # the unrotated mesh's shading.
+                    lin = inst_mat[0]
+                    inst_vset['norms'] = [_normalize3(
+                        lin[0][0]*nx + lin[0][1]*ny + lin[0][2]*nz,
+                        lin[1][0]*nx + lin[1][1]*ny + lin[1][2]*nz,
+                        lin[2][0]*nx + lin[2][1]*ny + lin[2][2]*nz)
+                        for nx, ny, nz in vset['norms']]
 
                 suffix = f"_{inst_idx:02d}" if len(pair_insts) > 1 else ""
                 obj_name = f"{basename}_{pair_idx:02d}{suffix}"
