@@ -34,6 +34,66 @@ def is_printable(b):
     return len(b) == 4 and all(0x20 <= c < 0x7F for c in b)
 
 
+IMAGE_HAS_ALPHA_KEY = "ffcc_has_alpha"
+
+
+def _image_has_alpha(img, default=True):
+    """Whether a texture actually carries transparency.
+
+    Plenty of FFCC textures are fully opaque even though their format can
+    express alpha (CMPR blocks in the 4-colour mode, RGBA8 with alpha 255
+    throughout); wiring their Alpha output into a shader adds a pointless
+    transparency path, so materials consult this first.
+
+    Normally answered by the tag _make_image() writes at decode time. An
+    untagged image (e.g. one left over from an import by an older version
+    of this addon) is scanned directly and then tagged, so the answer never
+    depends on import-time bookkeeping having happened.
+    """
+    if img is None:
+        return False
+    try:
+        cached = img.get(IMAGE_HAS_ALPHA_KEY)
+    except (AttributeError, TypeError):
+        return default
+    if cached is not None:
+        return bool(cached)
+    try:
+        px = img.pixels[:]
+        if not px:
+            return default
+        has = any(px[i] < 0.999 for i in range(3, len(px), 4))
+        img[IMAGE_HAS_ALPHA_KEY] = has
+        return has
+    except (AttributeError, TypeError, RuntimeError):
+        return default
+
+
+def _make_image(name, w, h, pixels):
+    """Build a packed bpy Image from a decoded RGBA byte buffer (top row
+    first; Blender wants bottom row first) and tag it with whether any
+    texel is non-opaque."""
+    img = bpy.data.images.new(name, width=w, height=h, alpha=True)
+    float_px = [0.0] * (w * h * 4)
+    opaque = True
+    for y in range(h):
+        src_row = h - 1 - y
+        for x in range(w):
+            si = (src_row * w + x) * 4
+            di = (y * w + x) * 4
+            a = pixels[si+3]
+            if a < 255:
+                opaque = False
+            float_px[di]   = pixels[si]   / 255.0
+            float_px[di+1] = pixels[si+1] / 255.0
+            float_px[di+2] = pixels[si+2] / 255.0
+            float_px[di+3] = a / 255.0
+    img.pixels = float_px
+    img.pack()
+    img[IMAGE_HAS_ALPHA_KEY] = not opaque
+    return img
+
+
 # ---- Texture decoders ----
 
 
@@ -182,19 +242,7 @@ def parse_mtx(data, image_registry=None):
                             pixels = None
 
                         if pixels is not None:
-                            img = bpy.data.images.new(name, width=w, height=h, alpha=True)
-                            float_px = [0.0] * (w * h * 4)
-                            for y in range(h):
-                                src_row = h - 1 - y
-                                for x in range(w):
-                                    si = (src_row * w + x) * 4
-                                    di = (y * w + x) * 4
-                                    float_px[di]   = pixels[si]   / 255.0
-                                    float_px[di+1] = pixels[si+1] / 255.0
-                                    float_px[di+2] = pixels[si+2] / 255.0
-                                    float_px[di+3] = pixels[si+3] / 255.0
-                            img.pixels = float_px
-                            img.pack()
+                            img = _make_image(name, w, h, pixels)
                             seen_names[name] = img
                             if reg_key is not None:
                                 image_registry[reg_key] = img
@@ -740,20 +788,29 @@ def _get_material(name, image, blend=None, blend_vcolors=False, fullbright=False
         mix.location  = (-200, 0)
         color_socket = mix.outputs['Color']
 
+    # Only route alpha when the texture actually has transparent texels —
+    # most FFCC textures are fully opaque, and feeding a constant-1.0 alpha
+    # into the shader just forces a pointless transparency path.
+    use_alpha = _image_has_alpha(image)
+
     if fullbright:
         # Bypass lighting via Emission, mixed with Transparent by alpha.
         emission = nodes.new('ShaderNodeEmission')
         links.new(color_socket, emission.inputs['Color'])
-        transp = nodes.new('ShaderNodeBsdfTransparent')
-        mix_shader = nodes.new('ShaderNodeMixShader')
-        links.new(tex.outputs['Alpha'], mix_shader.inputs['Fac'])
-        links.new(transp.outputs['BSDF'], mix_shader.inputs[1])
-        links.new(emission.outputs['Emission'], mix_shader.inputs[2])
-        links.new(mix_shader.outputs['Shader'], out.inputs['Surface'])
-        emission.location   = (0, 100)
-        transp.location      = (0, -100)
-        mix_shader.location  = (300, 0)
-        out.location         = (600, 0)
+        emission.location = (0, 100)
+        if use_alpha:
+            transp = nodes.new('ShaderNodeBsdfTransparent')
+            mix_shader = nodes.new('ShaderNodeMixShader')
+            links.new(tex.outputs['Alpha'], mix_shader.inputs['Fac'])
+            links.new(transp.outputs['BSDF'], mix_shader.inputs[1])
+            links.new(emission.outputs['Emission'], mix_shader.inputs[2])
+            links.new(mix_shader.outputs['Shader'], out.inputs['Surface'])
+            transp.location     = (0, -100)
+            mix_shader.location = (300, 0)
+            out.location        = (600, 0)
+        else:
+            links.new(emission.outputs['Emission'], out.inputs['Surface'])
+            out.location = (300, 0)
     else:
         bsdf = nodes.new('ShaderNodeBsdfPrincipled')
         # The game has no PBR roughness data; Principled BSDF's own default
@@ -763,13 +820,16 @@ def _get_material(name, image, blend=None, blend_vcolors=False, fullbright=False
         # materials that do want gloss can have it dialed back manually.
         bsdf.inputs['Roughness'].default_value = 1.0
         links.new(color_socket, bsdf.inputs['Base Color'])
-        links.new(tex.outputs['Alpha'], bsdf.inputs['Alpha'])
+        if use_alpha:
+            links.new(tex.outputs['Alpha'], bsdf.inputs['Alpha'])
         links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
         bsdf.location = (0, 0)
         out.location  = (300, 0)
 
     # ATRB byte 4 (FFCC_FORMAT_SPEC.md 2.3): 0x04 opaque, else blend/clip.
-    if blend == 4:
+    # An opaque texture stays OPAQUE whatever ATRB says — with no alpha in
+    # the graph a blended/clipped setting would render identically anyway.
+    if not use_alpha or blend == 4:
         mat.blend_method = 'OPAQUE'
     elif blend in (0, 1, 3):
         mat.blend_method = 'BLEND'
@@ -999,19 +1059,7 @@ def parse_tex(data):
                     else:
                         pixels = None
                     if pixels is not None:
-                        img = bpy.data.images.new(name, width=w, height=h, alpha=True)
-                        float_px = [0.0] * (w * h * 4)
-                        for y in range(h):
-                            src_row = h - 1 - y
-                            for x in range(w):
-                                si = (src_row * w + x) * 4
-                                di = (y * w + x) * 4
-                                float_px[di]   = pixels[si]   / 255.0
-                                float_px[di+1] = pixels[si+1] / 255.0
-                                float_px[di+2] = pixels[si+2] / 255.0
-                                float_px[di+3] = pixels[si+3] / 255.0
-                        img.pixels = float_px
-                        img.pack()
+                        img = _make_image(name, w, h, pixels)
                         seen_names[name] = img
                 except Exception:
                     img = None
@@ -1505,9 +1553,15 @@ def _get_character_material(name, image, blend, fmt, image2=None):
         tex2.location = (-760, -250)
         mix.location = (-450, 100)
     links.new(color_socket, bsdf.inputs['Base Color'])
-    links.new(alpha_socket, bsdf.inputs['Alpha'])
+    # Only route alpha when the texture really has transparent texels (see
+    # _get_material) — a fully opaque texture needs no transparency path.
+    use_alpha = _image_has_alpha(image)
+    if use_alpha:
+        links.new(alpha_socket, bsdf.inputs['Alpha'])
     links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
-    if blend is not None:
+    if not use_alpha:
+        mat.blend_method = 'OPAQUE'
+    elif blend is not None:
         if blend == 4:
             mat.blend_method = 'OPAQUE'
         elif blend in (0, 1, 3):
